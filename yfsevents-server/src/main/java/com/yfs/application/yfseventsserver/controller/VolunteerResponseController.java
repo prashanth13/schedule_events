@@ -27,7 +27,7 @@ public class VolunteerResponseController {
        System.out.println(emailID);
         int exist=volunteersAcceptedRepository.checkEmailIdEventId(emailID,eventid);
         System.out.println(exist);
-       if(exist==1)
+       if(exist > 0)
        {
            volunteersAcceptedRepository.updateAccepted(emailID,eventid);
            return "You are registered successfully";
@@ -37,7 +37,7 @@ public class VolunteerResponseController {
    @RequestMapping(value="/set",method = RequestMethod.GET)
     public String set()
    {
-       emailController.fun();
+       //emailController.fun();
        return "Done";
    }
 

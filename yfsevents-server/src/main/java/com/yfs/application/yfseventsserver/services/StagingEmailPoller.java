@@ -2,12 +2,11 @@ package com.yfs.application.yfseventsserver.services;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yfs.application.yfseventsserver.controller.EmailController;
-import com.yfs.application.yfseventsserver.entity.Email;
-import com.yfs.application.yfseventsserver.entity.StagingEmail;
-import com.yfs.application.yfseventsserver.entity.VolunteersAccepted;
+import com.yfs.application.yfseventsserver.entity.*;
 import com.yfs.application.yfseventsserver.model.EmailStatus;
+import com.yfs.application.yfseventsserver.repository.EmailSettingsRepository;
+import com.yfs.application.yfseventsserver.repository.EventDataRepository;
 import com.yfs.application.yfseventsserver.repository.StagingEmailDataRepository;
-import com.yfs.application.yfseventsserver.repository.VolunteerRepository;
 import com.yfs.application.yfseventsserver.repository.VolunteersAcceptedRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,8 +19,8 @@ import org.springframework.util.StringUtils;
 
 import javax.transaction.Transactional;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 @Service
@@ -34,10 +33,23 @@ public class StagingEmailPoller {
     ObjectMapper objectMapper;
 
     @Autowired
+    EmailSettingsRepository emailSettingsRepository;
+
+
+    @Autowired
+    EmailController emailController;
+
+    @Autowired
     StagingEmailDataRepository stagingEmailDataRepository;
 
     @Autowired
     VolunteersAcceptedRepository volunteersAcceptedRepository;
+
+    @Autowired
+    EventDataRepository eventDataRepository;
+
+    @Value("${baseUrl}")
+    String baseUrl;
 
     private static Logger logger = LoggerFactory.getLogger(StagingEmailPoller.class);
 
@@ -51,15 +63,16 @@ public class StagingEmailPoller {
             logger.info("No pending staging mail to be processed...");
             return;
         }
-
-        stagingEmails.parallelStream().forEach(i -> processEmail(i));
+//
+//        stagingEmails.parallelStream().forEach(i -> processEmail(i));
+        stagingEmails.forEach(StagingEmail->{processEmail(StagingEmail);});
 
 
     }
 
     @Transactional
     private void processEmail(StagingEmail stagingEmail) {
-        final List<Email> filedEmailList = new ArrayList<>();
+        final List<Email> failedEmailList = new ArrayList<>();
         if (null == stagingEmail) {
             logger.info("stagingEmail is null hence skipping");
         }
@@ -72,47 +85,49 @@ public class StagingEmailPoller {
                 Stream.of(toList).forEach(emailId -> {
                     VolunteersAccepted volunteersAccepted = new VolunteersAccepted(stagingEmail.getEventId(), emailId, false, VolunteersAccepted.EmailNotificationStatus.NOT_SENT);
                     logger.info("About to send email to [{}] with subject[{}]", emailId,email.getSubject());
-                    boolean isEmailSent = EmailController.sendMailController(emailId,email.getCc(),email.getBcc(),email.getSubject(),email.getText());
+
+                   boolean isEmailSent = emailController.sendMailController(emailId,email.getCc(),email.getBcc(),email.getSubject(),createUrl(email.getText(),emailId,email.getEventId().toString()));
                     if (isEmailSent) {
                         volunteersAccepted.setStatus(VolunteersAccepted.EmailNotificationStatus.SENT);
                         volunteersAcceptedRepository.save(volunteersAccepted);
                     }else{
                         volunteersAccepted.setStatus(VolunteersAccepted.EmailNotificationStatus.NOT_SENT);
                         volunteersAcceptedRepository.save(volunteersAccepted);
-                        filedEmailList.add(email);
+                        failedEmailList.add(email);
                     }
                 });
 
                 stagingEmail.setStatus(EmailStatus.IN_PROGRESS);
-                stagingEmailDataRepository.save(stagingEmail);
 
             } else {
                // List<VolunteersAccepted> volunteersAcceptedList = getVolunteersAcceptedList();
-                List<VolunteersAccepted> volunteersAcceptedList = volunteersAcceptedRepository.getAllByEmailNotSent();
-                Email email = objectMapper.readValue(stagingEmail.getPayload(), Email.class);
-                volunteersAcceptedList.stream().forEach(volunteersAccepted -> {
-                    String emailId = volunteersAccepted.getMailId();
-                    logger.info("processEmail Retry[{}]:: About to send email to[{}] with subject[{}]", retryCount, emailId,email.getSubject());
-                    boolean isEmailSent = EmailController.sendMailController(emailId,email.getCc(),email.getBcc(),email.getSubject(),email.getText());
+                List<VolunteersAccepted> volunteersAcceptedList = volunteersAcceptedRepository.getUnsentVolunteersByEventId(stagingEmail.getEventId());
 
-                    if (isEmailSent) {
-                        volunteersAccepted.setStatus(VolunteersAccepted.EmailNotificationStatus.SENT);
-                        volunteersAcceptedRepository.save(volunteersAccepted);
-                    }else{
-                        filedEmailList.add(email);
-
-                        if(retryCount == maxRetryCountAllowed){
-                            volunteersAccepted.setStatus(VolunteersAccepted.EmailNotificationStatus.FAILED);
+                if(! CollectionUtils.isEmpty(volunteersAcceptedList)) {
+                    Email email = objectMapper.readValue(stagingEmail.getPayload(), Email.class);
+                    volunteersAcceptedList.stream().forEach(volunteersAccepted -> {
+                        String emailId = volunteersAccepted.getMailId();
+                        logger.info("processEmail Retry[{}]:: About to send email to[{}] with subject[{}]", retryCount, emailId, email.getSubject());
+                        boolean isEmailSent = emailController.sendMailController(emailId, email.getCc(), email.getBcc(), email.getSubject(), email.getText());
+                        if (isEmailSent) {
+                            volunteersAccepted.setStatus(VolunteersAccepted.EmailNotificationStatus.SENT);
                             volunteersAcceptedRepository.save(volunteersAccepted);
+                        } else {
+                            failedEmailList.add(email);
+
+                            if (retryCount == maxRetryCountAllowed) {
+                                volunteersAccepted.setStatus(VolunteersAccepted.EmailNotificationStatus.FAILED);
+                                volunteersAcceptedRepository.save(volunteersAccepted);
+                            }
                         }
-                    }
-                });
+                    });
+                }
 
             }
 
 
             stagingEmail.setRetryCount(retryCount);
-            if(CollectionUtils.isEmpty(filedEmailList)){
+            if(CollectionUtils.isEmpty(failedEmailList)){
                 stagingEmail.setStatus(EmailStatus.COMPLETED);
             }else if(retryCount == maxRetryCountAllowed){
                 stagingEmail.setStatus(EmailStatus.FAILED);
@@ -122,5 +137,31 @@ public class StagingEmailPoller {
         }catch(Exception e){
             logger.error("Failed to process stagingEmail[{}] with exception[{}]",stagingEmail,e);
         }
+    }
+
+
+    public String createUrl(String content,String emailId,String eventId)
+    {
+
+        Optional<EmailSettings> emailSettings = emailSettingsRepository.findById(1);
+
+
+        if(emailSettings.isPresent()) {
+            baseUrl = emailSettings.get().getBaseUrl();
+        }
+        String uniqueUrl="";
+        uniqueUrl=uniqueUrl+baseUrl+emailId.split("@")[0]+"/"+emailId.split("@")[1]+"/"+eventId;
+        System.out.println("Unique Link is "+uniqueUrl);
+        content=content+"<br/>\nPlease click on the the following link to accept our invitation.<br> \n" +
+            "<a href=\""+uniqueUrl+"\">Click here to accept invitation</a><br><br>\n";
+        content=content+
+            "<br/>\nFor More information contact do us at :<br>\n" +
+            "Website: https://www.youthforseva.org<br>\n" +
+
+
+            "</body>\n" +
+            "</html>\n";
+
+        return content;
     }
 }
